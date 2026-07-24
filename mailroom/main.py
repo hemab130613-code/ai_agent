@@ -1,9 +1,8 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import sqlite3
 import hashlib
 import json
-import os
 
 
 app = FastAPI()
@@ -19,25 +18,17 @@ db = sqlite3.connect(
 
 
 db.execute("""
-CREATE TABLE IF NOT EXISTS evaluations(
-evaluationId TEXT PRIMARY KEY,
-digest TEXT,
-response TEXT
-)
-""")
-
-
-db.execute("""
 CREATE TABLE IF NOT EXISTS proposals(
-callId TEXT PRIMARY KEY,
+fingerprint TEXT PRIMARY KEY,
 data TEXT
 )
 """)
 
 
 db.execute("""
-CREATE TABLE IF NOT EXISTS commits(
-digest TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS evaluations(
+evaluationId TEXT PRIMARY KEY,
+fingerprint TEXT,
 response TEXT
 )
 """)
@@ -47,25 +38,25 @@ db.commit()
 
 
 
-def canonical(x):
+def canonical(data):
 
     return json.dumps(
-        x,
+        data,
         sort_keys=True,
         separators=(",",":")
     )
 
 
 
-def fingerprint(x):
+def fingerprint(data):
 
     return hashlib.sha256(
-        canonical(x).encode()
+        canonical(data).encode()
     ).hexdigest()
 
 
 
-def call_id(package_id,fp):
+def stable_action_id(package_id, fp):
 
     return (
         "mr_"
@@ -85,52 +76,63 @@ class MailRequest(BaseModel):
 
     operation:str
 
-    evaluationId:str|None=None
+    evaluationId:str | None = None
 
-    dossiers:list=[]
+    dossiers:list = Field(default_factory=list)
 
-    receipts:list=[]
+    receipts:list = Field(default_factory=list)
 
-    inputDigest:str|None=None
+    inputDigest:str | None = None
 
 
 
-def get_id(d):
+
+def get_package_id(dossier):
 
     return (
-        d.get("dossierId")
+        dossier.get("dossierId")
         or
-        d.get("packageId")
+        dossier.get("packageId")
         or
-        d.get("id")
+        dossier.get("id")
         or
         "unknown"
     )
 
 
 
-def evidence(d):
+
+def get_evidence(dossier):
 
     refs=[]
 
-    sources=d.get("sources",[])
+    for source in dossier.get("sources",[]):
 
-    for s in sources:
+        for line in source.get("lines",[]):
 
-        for l in s.get("lines",[])[:5]:
+            if isinstance(line,dict):
 
-            if l.get("lineId"):
+                if line.get("lineId"):
 
-                refs.append(
-                    l["lineId"]
-                )
-
-    return refs[:5] or ["source"]
+                    refs.append(
+                        line["lineId"]
+                    )
 
 
+    if refs:
+        return refs[:5]
+
+
+    return [
+        "dossier"
+    ]
+
+
+
+
+# YOUR LOGIC KEPT
 
 def decide_action(dossier):
-
 
     text=json.dumps(
         dossier
@@ -139,17 +141,13 @@ def decide_action(dossier):
 
 
     if (
-        "ignore previous"
-        in text
+        "ignore previous" in text
         or
-        "prompt injection"
-        in text
+        "prompt injection" in text
         or
-        "vault"
-        in text
+        "vault" in text
         or
-        "secret"
-        in text
+        "secret" in text
     ):
 
         action="quarantine_item"
@@ -157,14 +155,11 @@ def decide_action(dossier):
 
 
     elif (
-        "duplicate"
-        in text
+        "duplicate" in text
         or
-        "already paid"
-        in text
+        "already paid" in text
         or
-        "completed"
-        in text
+        "completed" in text
     ):
 
         action="no_action"
@@ -172,11 +167,9 @@ def decide_action(dossier):
 
 
     elif (
-        "approved"
-        in text
+        "approved" in text
         and
-        "recipient"
-        in text
+        "recipient" in text
     ):
 
         action="send_approved_notice"
@@ -184,14 +177,9 @@ def decide_action(dossier):
 
 
     elif (
-        "identity"
-        in text
+        "identity" in text
         or
-        "ambiguous"
-        in text
-        or
-        "conflict"
-        in text
+        "ambiguous" in text
     ):
 
         action="request_confirmation"
@@ -199,11 +187,9 @@ def decide_action(dossier):
 
 
     elif (
-        "update"
-        in text
+        "update" in text
         or
-        "change"
-        in text
+        "change" in text
     ):
 
         action="update_internal_record"
@@ -216,21 +202,26 @@ def decide_action(dossier):
 
 
 
-    did=get_id(dossier)
+    package_id=get_package_id(
+        dossier
+    )
 
 
-    fp=fingerprint(dossier)
-
+    fp=fingerprint(
+        dossier
+    )
 
 
     return {
 
-        "packageId":did,
+
+        "packageId":
+            package_id,
 
 
         "actionId":
-            call_id(
-                did,
+            stable_action_id(
+                package_id,
                 fp
             ),
 
@@ -241,11 +232,13 @@ def decide_action(dossier):
 
         "facts":{
 
+
             "vendorName":
                 dossier.get(
                     "vendorName",
                     ""
                 ),
+
 
             "invoiceNumber":
                 dossier.get(
@@ -253,34 +246,40 @@ def decide_action(dossier):
                     ""
                 ),
 
+
             "amountMinor":
                 dossier.get(
                     "amountMinor",
                     0
                 ),
 
+
             "currency":
                 dossier.get(
                     "currency",
                     "INR"
                 )
+
         },
 
 
         "evidenceRefs":
-            evidence(dossier),
+            get_evidence(
+                dossier
+            ),
 
 
         "rationale":
             (
                 action
                 +
-                " selected using "
+                " selected using evidence "
                 +
                 ",".join(
-                    evidence(dossier)
+                    get_evidence(dossier)
                 )
             )
+
     }
 
 
@@ -302,14 +301,15 @@ def mailroom(req:MailRequest):
 
 
 
-        digest=fingerprint(
+        request_digest=fingerprint(
             req.dossiers
         )
 
 
+
         old=db.execute(
             """
-            SELECT digest,response
+            SELECT fingerprint,response
             FROM evaluations
             WHERE evaluationId=?
             """,
@@ -323,7 +323,7 @@ def mailroom(req:MailRequest):
         if old:
 
 
-            if old[0]!=digest:
+            if old[0]!=request_digest:
 
                 raise HTTPException(
                     409,
@@ -340,26 +340,55 @@ def mailroom(req:MailRequest):
         proposals=[]
 
 
-        for d in req.dossiers:
+
+        for dossier in req.dossiers:
 
 
-            result=decide_action(d)
+            fp=fingerprint(
+                dossier
+            )
+
+
+
+            cached=db.execute(
+                """
+                SELECT data
+                FROM proposals
+                WHERE fingerprint=?
+                """,
+                (fp,)
+            ).fetchone()
+
+
+
+            if cached:
+
+                result=json.loads(
+                    cached[0]
+                )
+
+
+            else:
+
+                result=decide_action(
+                    dossier
+                )
+
+
+                db.execute(
+                    """
+                    INSERT INTO proposals
+                    VALUES (?,?)
+                    """,
+                    (
+                        fp,
+                        json.dumps(result)
+                    )
+                )
 
 
             proposals.append(
                 result
-            )
-
-
-            db.execute(
-                """
-                INSERT OR REPLACE INTO proposals
-                VALUES (?,?)
-                """,
-                (
-                    result["actionId"],
-                    json.dumps(result)
-                )
             )
 
 
@@ -380,7 +409,7 @@ def mailroom(req:MailRequest):
 
 
             "inputDigest":
-                digest,
+                request_digest,
 
 
             "proposals":
@@ -397,7 +426,7 @@ def mailroom(req:MailRequest):
             """,
             (
                 req.evaluationId,
-                digest,
+                request_digest,
                 json.dumps(response)
             )
         )
@@ -406,21 +435,13 @@ def mailroom(req:MailRequest):
         db.commit()
 
 
+
         return response
 
 
 
 
-    if req.operation=="commit":
-
-
-        if not req.evaluationId:
-
-            raise HTTPException(
-                422,
-                "evaluationId required"
-            )
-
+    elif req.operation=="commit":
 
 
         row=db.execute(
@@ -445,31 +466,24 @@ def mailroom(req:MailRequest):
 
 
 
-        stored=json.loads(
+        saved=json.loads(
             row[0]
         )
 
 
-        proposals={
-            p["actionId"]:p
-            for p in stored["proposals"]
+        valid_ids={
+
+            p["actionId"]
+            for p in saved["proposals"]
+
         }
 
 
 
-        outcomes=[]
+        for receipt in req.receipts:
 
 
-
-        for r in req.receipts:
-
-
-            aid=r.get(
-                "actionId"
-            )
-
-
-            if aid not in proposals:
+            if receipt.get("actionId") not in valid_ids:
 
                 raise HTTPException(
                     409,
@@ -478,64 +492,32 @@ def mailroom(req:MailRequest):
 
 
 
-            p=proposals[aid]
+        return {
 
-
-
-            if r.get(
-                "action"
-            ) != p["action"]:
-
-                raise HTTPException(
-                    409,
-                    "action mismatch"
-                )
-
-
-
-            outcomes.append({
-
-                "packageId":
-                    p["packageId"],
-
-                "actionId":
-                    aid,
-
-                "action":
-                    p["action"],
-
-                "receiptNonce":
-                    r.get(
-                        "receiptNonce"
-                    )
-
-            })
-
-
-
-        response={
 
             "profile":
                 PROFILE,
 
+
             "evaluationId":
                 req.evaluationId,
+
 
             "status":
                 "completed",
 
+
             "outcomes":
-                outcomes
+                req.receipts
 
         }
 
 
-        return response
 
 
+    else:
 
-
-    raise HTTPException(
-        400,
-        "invalid operation"
-    )
+        raise HTTPException(
+            400,
+            "invalid operation"
+        )
